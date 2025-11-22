@@ -1,627 +1,768 @@
 
 import React, { useState, useEffect, useRef } from 'react';
-import { bookPages, sectionToc } from './constants/bookData';
-import Sidebar from './components/Sidebar';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { LoginView, SignupView } from './components/AuthViews';
+import Dashboard from './components/Dashboard';
 import BookPage from './components/BookPage';
+import QuizView from './components/QuizView';
 import ThemeToggle from './components/ThemeToggle';
-import SearchBar from './components/SearchBar';
+import { CourseModule, ContentItem } from './types';
+import Hero from './components/Hero';
 import { GoogleGenAI, Modality } from "@google/genai";
+import { getCourseStructure } from './utils/dataMapper';
 
-const FONT_SIZE_LEVELS = [
-  { base: 'text-base', h1: 'text-3xl', h2: 'text-2xl', h3: 'text-xl', h4: 'text-lg' },
-  { base: 'text-lg', h1: 'text-4xl md:text-5xl', h2: 'text-3xl md:text-4xl', h3: 'text-2xl md:text-3xl', h4: 'text-xl md:text-2xl' },
-  { base: 'text-xl', h1: 'text-5xl md:text-6xl', h2: 'text-4xl md:text-5xl', h3: 'text-3xl md:text-4xl', h4: 'text-2xl md:text-3xl' },
-  { base: 'text-2xl', h1: 'text-6xl md:text-7xl', h2: 'text-5xl md:text-6xl', h3: 'text-4xl md:text-5xl', h4: 'text-3xl md:text-4xl' },
-];
+// --- Helper to extract text from content for TTS ---
+const extractTextFromPage = (content: ContentItem[]): string => {
+    let text = "";
+    content.forEach(item => {
+        if (item.text) text += item.text + ". ";
+        if (item.items) text += item.items.join(". ") + ". ";
+        if (item.content) text += extractTextFromPage(item.content);
+    });
+    return text;
+};
 
-type Theme = 'light' | 'dark';
+// --- Smart Segmentation for Real-Time Streaming ---
+// Optimized for "Instant Start" + "Continuous Play"
+const segmentTextForStreaming = (fullText: string): string[] => {
+    // 1. Split by sentence ending punctuation (. ! ? :) to get logical pauses
+    // 2. Filter out empty/whitespace only
+    const rawSegments = fullText.split(/([.!?։]+)/).reduce((acc: string[], curr, idx, arr) => {
+        if (idx % 2 === 0) {
+             const nextChar = arr[idx + 1] || "";
+             if (curr.trim()) acc.push(curr.trim() + nextChar);
+        }
+        return acc;
+    }, []);
 
-// --- TTS Helpers ---
-function decodeAudioData(base64: string): Uint8Array {
-  const binaryString = atob(base64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
-  }
-  return bytes;
-}
+    // 3. Optimization: Ensure the FIRST segment is short (for speed), 
+    //    but subsequent segments are grouped to reduce API calls overhead.
+    const finalSegments: string[] = [];
+    let buffer = "";
 
-async function createAudioBuffer(
-  data: Uint8Array,
-  ctx: AudioContext,
-  sampleRate: number = 24000,
-  numChannels: number = 1
-): Promise<AudioBuffer> {
-  const dataInt16 = new Int16Array(data.buffer);
-  const frameCount = dataInt16.length / numChannels;
-  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+    rawSegments.forEach((seg, index) => {
+        // Always push the very first sentence immediately so playback starts ASAP
+        if (index === 0) {
+            finalSegments.push(seg);
+        } else {
+            // For subsequent text, bundle sentences together (~200 chars) for smoother flow
+            if ((buffer + seg).length < 200) {
+                buffer += " " + seg;
+            } else {
+                finalSegments.push(buffer.trim());
+                buffer = seg;
+            }
+        }
+    });
+    if (buffer.trim()) finalSegments.push(buffer.trim());
 
-  for (let channel = 0; channel < numChannels; channel++) {
-    const channelData = buffer.getChannelData(channel);
-    for (let i = 0; i < frameCount; i++) {
-      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
-    }
-  }
-  return buffer;
-}
-// --- End TTS Helpers ---
+    return finalSegments.length > 0 ? finalSegments : [fullText];
+};
 
-const App: React.FC = () => {
-  const [activeSectionId, setActiveSectionId] = useState('cover');
-  const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem('theme') as Theme) || 'light');
-  const [zoomLevel, setZoomLevel] = useState(1);
-  const [currentPage, setCurrentPage] = useState(1);
-  // Change: Store array of bookmarked pages
-  const [bookmarkedPages, setBookmarkedPages] = useState<number[]>([]);
-  const [isPreviewMode, setIsPreviewMode] = useState(false);
-  const [targetPageForAnimation, setTargetPageForAnimation] = useState<number | null>(null);
-  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+
+// --- Main App Controller ---
+
+const AppContent: React.FC = () => {
+  const { user, loading, progress, updateProgress } = useAuth();
+  const [currentView, setCurrentView] = useState<'landing' | 'auth' | 'dashboard' | 'player'>('landing');
+  const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
+  const [activeModule, setActiveModule] = useState<CourseModule | null>(null);
   
+  // Player State
+  const [currentUnitIndex, setCurrentUnitIndex] = useState(0);
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => (localStorage.getItem('theme') as 'light' | 'dark') || 'light');
+  const [showQuiz, setShowQuiz] = useState(false);
+  const [isReadingMode, setIsReadingMode] = useState(false);
+  const [fontSizeLevel, setFontSizeLevel] = useState(2); // 1 to 5
+  const [showMobileSettings, setShowMobileSettings] = useState(false); // New state for mobile menu
+
+  // Refs
+  const parallaxRef1 = useRef<HTMLDivElement>(null);
+  const parallaxRef2 = useRef<HTMLDivElement>(null);
+  const mainContentRef = useRef<HTMLElement>(null); // Ref for scrolling container
+
   // TTS State
   const [playingAudioPage, setPlayingAudioPage] = useState<number | null>(null);
-  const [generatingPageId, setGeneratingPageId] = useState<number | null>(null); // Track which page is loading
+  const [generatingPageId, setGeneratingPageId] = useState<number | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
-  const audioRequestIdRef = useRef<number>(0); // To handle race conditions
+  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const audioRequestIdRef = useRef<number>(0);
+  const nextStartTimeRef = useRef<number>(0);
 
-  // Parallax Refs
-  const lightBlob1Ref = useRef<HTMLDivElement>(null);
-  const lightBlob2Ref = useRef<HTMLDivElement>(null);
-  const lightBlob3Ref = useRef<HTMLDivElement>(null);
-  const darkBlob1Ref = useRef<HTMLDivElement>(null);
-  const darkBlob2Ref = useRef<HTMLDivElement>(null);
-  const darkBlob3Ref = useRef<HTMLDivElement>(null);
+  // Sidebar State (Mobile)
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
-  const pageRefs = useRef<(HTMLDivElement | null)[]>([]);
-
-  // Load bookmarks
-  useEffect(() => {
-    const saved = localStorage.getItem('bookmarkedPages');
-    if (saved) {
-      try {
-        setBookmarkedPages(JSON.parse(saved));
-      } catch (e) {
-        console.error("Failed to parse bookmarks", e);
-      }
-    }
-  }, []);
-
-  // Save bookmarks
-  useEffect(() => {
-    localStorage.setItem('bookmarkedPages', JSON.stringify(bookmarkedPages));
-  }, [bookmarkedPages]);
-
-  // Theme effect
   useEffect(() => {
     const root = window.document.documentElement;
-    if (theme === 'dark') {
-      root.classList.add('dark');
-    } else {
-      root.classList.remove('dark');
-    }
+    if (theme === 'dark') root.classList.add('dark');
+    else root.classList.remove('dark');
     localStorage.setItem('theme', theme);
   }, [theme]);
 
-  // Parallax Effect
   useEffect(() => {
-    const handleScroll = () => {
-        const scrollY = window.scrollY;
-        requestAnimationFrame(() => {
-            // Light Mode Blobs
-            if (lightBlob1Ref.current) lightBlob1Ref.current.style.transform = `translateY(${scrollY * 0.2}px)`;
-            if (lightBlob2Ref.current) lightBlob2Ref.current.style.transform = `translateY(${scrollY * -0.15}px)`;
-            if (lightBlob3Ref.current) lightBlob3Ref.current.style.transform = `translateY(${scrollY * 0.1}px)`;
-            
-            // Dark Mode Blobs
-            if (darkBlob1Ref.current) darkBlob1Ref.current.style.transform = `translateY(${scrollY * 0.25}px)`;
-            if (darkBlob2Ref.current) darkBlob2Ref.current.style.transform = `translateY(${scrollY * -0.2}px)`;
-            if (darkBlob3Ref.current) darkBlob3Ref.current.style.transform = `translateY(${scrollY * 0.15}px)`;
-        });
-    };
-
-    window.addEventListener('scroll', handleScroll, { passive: true });
-    return () => window.removeEventListener('scroll', handleScroll);
-  }, []);
-
-  // Keyboard listeners
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && isPreviewMode) {
-        setIsPreviewMode(false);
+    if (!loading) {
+      if (user) {
+        if (currentView === 'landing' || currentView === 'auth') {
+           setCurrentView('dashboard');
+        }
+      } else {
+        if (currentView === 'dashboard' || currentView === 'player') {
+           setCurrentView('landing');
+        }
       }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isPreviewMode]);
-  
-  // Observer for Scroll Spy
-  useEffect(() => {
-    pageRefs.current = pageRefs.current.slice(0, bookPages.length);
-    
-    const options = {
-      root: null,
-      rootMargin: '-40% 0px -40% 0px',
-      threshold: 0.1
-    };
-
-    const navigationObserver = new IntersectionObserver((entries) => {
-        entries.forEach((entry) => {
-          if (entry.isIntersecting) {
-            const pageId = entry.target.id;
-            const pageNumber = parseInt(pageId.replace('page-', ''), 10);
-            setCurrentPage(pageNumber);
-            const pageData = bookPages.find(p => p.pageNumber === pageNumber);
-            if(pageData) {
-              setActiveSectionId(pageData.sectionId);
-            }
-          }
-        });
-      }, options);
-
-    pageRefs.current.forEach((ref) => {
-      if (ref) navigationObserver.observe(ref);
-    });
-    return () => {
-      pageRefs.current.forEach((ref) => {
-        if (ref) navigationObserver.unobserve(ref);
-      });
-    };
-  }, []);
-
-  // TTS Handler with Race Condition Fix
-  const handlePlayAudio = async (text: string, pageId: number) => {
-    // 1. Stop any existing audio immediately
-    if (sourceNodeRef.current) {
-        try { sourceNodeRef.current.stop(); } catch(e) {}
-        sourceNodeRef.current = null;
     }
+  }, [user, loading, currentView]);
 
-    // 2. If we clicked the same page that is playing, just stop and return (toggle off)
-    if (playingAudioPage === pageId) {
-        setPlayingAudioPage(null);
-        setGeneratingPageId(null);
+  // Audio Helper Functions
+  function decodeAudioData(base64: string): Uint8Array {
+      const binaryString = atob(base64);
+      const len = binaryString.length;
+      const bytes = new Uint8Array(len);
+      for (let i = 0; i < len; i++) bytes[i] = binaryString.charCodeAt(i);
+      return bytes;
+  }
+
+  async function createAudioBuffer(data: Uint8Array, ctx: AudioContext): Promise<AudioBuffer> {
+      const dataInt16 = new Int16Array(data.buffer);
+      const frameCount = dataInt16.length;
+      const buffer = ctx.createBuffer(1, frameCount, 24000);
+      const channelData = buffer.getChannelData(0);
+      for (let i = 0; i < frameCount; i++) channelData[i] = dataInt16[i] / 32768.0;
+      return buffer;
+  }
+
+  const stopAudio = () => {
+      activeSourcesRef.current.forEach(source => {
+          try { source.stop(); } catch(e) {}
+      });
+      activeSourcesRef.current = [];
+      setPlayingAudioPage(null);
+      setGeneratingPageId(null);
+      audioRequestIdRef.current = 0; // Invalidate current request
+  };
+
+  // New "Streaming" Logic - Phrase by Phrase
+  const handlePlayAudio = async () => {
+    // If no active module or page, ignore
+    if (!activeModule) return;
+    const currentPage = activeModule.pages[currentUnitIndex];
+    const pageId = currentPage.pageNumber;
+    
+    // Toggle OFF if already playing
+    if (playingAudioPage === pageId || generatingPageId === pageId) {
+        stopAudio();
         return;
     }
 
-    // 3. Generate a new Request ID. This invalidates any previous pending requests.
+    // Stop any other playing audio first
+    stopAudio();
+
+    const fullText = extractTextFromPage(currentPage.content);
+    if (!fullText || fullText.trim().length === 0) return;
+
     const currentRequestId = Date.now();
     audioRequestIdRef.current = currentRequestId;
-
-    setPlayingAudioPage(null); // Clear playing state
-    
-    if (!text || text.trim().length === 0) return;
-
-    setGeneratingPageId(pageId); // Start loading for this specific page
+    setGeneratingPageId(pageId); 
 
     try {
         const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash-preview-tts",
-            contents: [{ parts: [{ text: text }] }],
-            config: {
-                responseModalities: [Modality.AUDIO],
-                speechConfig: {
-                    voiceConfig: {
-                        prebuiltVoiceConfig: { voiceName: 'Zephyr' },
-                    },
-                },
-            },
-        });
-
-        // Check if a newer request started while we were waiting
-        if (audioRequestIdRef.current !== currentRequestId) {
-            console.log("Audio request superseded, ignoring result.");
-            return;
-        }
-
-        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
         
-        if (base64Audio) {
-            if (!audioContextRef.current) {
-                audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-            }
-            
-            if (audioContextRef.current.state === 'suspended') {
-                await audioContextRef.current.resume();
-            }
+        // 1. Initialize Audio Context
+        if (!audioContextRef.current) audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+        if (audioContextRef.current.state === 'suspended') await audioContextRef.current.resume();
+        
+        // Reset timing
+        nextStartTimeRef.current = audioContextRef.current.currentTime + 0.1; // Start shortly in the future
 
-            const audioData = decodeAudioData(base64Audio);
-            const audioBuffer = await createAudioBuffer(audioData, audioContextRef.current, 24000, 1);
+        // 2. Segment Text
+        const segments = segmentTextForStreaming(fullText);
+        
+        setPlayingAudioPage(pageId); // Show playing state immediately
+
+        // 3. Sequential Fetch & Schedule
+        // We fetch one chunk, schedule it, then fetch the next.
+        for (let i = 0; i < segments.length; i++) {
+            if (audioRequestIdRef.current !== currentRequestId) break; // Stopped by user
+
+            const segmentText = segments[i];
             
-            const source = audioContextRef.current.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(audioContextRef.current.destination);
-            
-            source.onended = () => {
-                setPlayingAudioPage(prev => prev === pageId ? null : prev);
-            };
-            
-            // Final check before playing
-            if (audioRequestIdRef.current !== currentRequestId) {
-                return;
+            // Generate Audio for this segment
+            const response = await ai.models.generateContent({
+                model: "gemini-2.5-flash-preview-tts",
+                contents: [{ parts: [{ text: segmentText }] }],
+                config: {
+                    responseModalities: [Modality.AUDIO],
+                    speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } } },
+                },
+            });
+
+            if (audioRequestIdRef.current !== currentRequestId) break;
+
+            const base64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+            if (base64) {
+                setGeneratingPageId(null); // Stop spinner once first chunk arrives
+
+                const audioData = decodeAudioData(base64);
+                const audioBuffer = await createAudioBuffer(audioData, audioContextRef.current);
+                
+                const source = audioContextRef.current.createBufferSource();
+                source.buffer = audioBuffer;
+                source.connect(audioContextRef.current.destination);
+                
+                // Schedule smoothly
+                // If previous chunks took longer than expected, start now. 
+                // If we are ahead (buffering), schedule at the end of previous.
+                const scheduleTime = Math.max(audioContextRef.current.currentTime, nextStartTimeRef.current);
+                source.start(scheduleTime);
+                
+                nextStartTimeRef.current = scheduleTime + audioBuffer.duration;
+                
+                // Track source to stop later
+                activeSourcesRef.current.push(source);
+                
+                // Clean up source ref when done (optional memory management)
+                source.onended = () => {
+                     const index = activeSourcesRef.current.indexOf(source);
+                     if (index > -1) activeSourcesRef.current.splice(index, 1);
+                     // If this was the last chunk and queue is empty, stop UI
+                     if (i === segments.length - 1 && activeSourcesRef.current.length === 0) {
+                         setPlayingAudioPage(null);
+                     }
+                };
             }
-            
-            setPlayingAudioPage(pageId);
-            source.start();
-            sourceNodeRef.current = source;
         }
+
     } catch (error) {
-        // Only alert if this is still the active request
-        if (audioRequestIdRef.current === currentRequestId) {
-            console.error("Error generating speech:", error);
-            // Optional: alert("تعذر توليد الصوت حالياً");
-        }
+        console.error("TTS Error", error);
+        stopAudio();
     } finally {
-        // Only clear loading if this is the active request
         if (audioRequestIdRef.current === currentRequestId) {
             setGeneratingPageId(null);
         }
     }
   };
 
-  const animateScrollToPage = (pageNum: number) => {
-      if (pageNum >= 1 && pageNum <= bookPages.length) {
-        setTargetPageForAnimation(pageNum);
-        const targetElement = document.getElementById(`page-${pageNum}`);
-        if (targetElement) {
-          targetElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
-          setTimeout(() => {
-            setTargetPageForAnimation(null);
-          }, 1500);
-        }
-      }
-  };
-
-  const handleNavigate = (sectionId: string) => {
-    setIsMobileMenuOpen(false);
-    const section = sectionToc.find((s) => s.id === sectionId);
-    if (section) {
-        animateScrollToPage(section.startPage);
-    }
-  };
-
-  const navigateToPage = (pageNum: number) => {
-    setIsMobileMenuOpen(false);
-    animateScrollToPage(pageNum);
-  };
-  
-  const handleThemeToggle = () => {
-    setTheme(prevTheme => prevTheme === 'light' ? 'dark' : 'light');
-  };
-  
-  const handleSearch = (query: string) => {
-    setIsMobileMenuOpen(false);
-    const pageNum = parseInt(query, 10);
-    if (!isNaN(pageNum)) {
-      navigateToPage(pageNum);
-      return;
-    }
-    const lowerCaseQuery = query.toLowerCase();
-    const targetSection = sectionToc.find(s => s.title.toLowerCase().includes(lowerCaseQuery));
-    if(targetSection) {
-        handleNavigate(targetSection.id);
-    }
-  };
-
-  // Modified to support multiple bookmarks
-  const handleToggleBookmark = () => {
-    setBookmarkedPages(prev => {
-      if (prev.includes(currentPage)) {
-        return prev.filter(p => p !== currentPage);
+  const scrollToTop = () => {
+      if (mainContentRef.current) {
+          mainContentRef.current.scrollTo({ top: 0, behavior: 'auto' }); // Instant scroll
       } else {
-        return [...prev, currentPage].sort((a, b) => a - b);
+          window.scrollTo({ top: 0, behavior: 'auto' });
       }
-    });
   };
 
-  const currentFontConfig = FONT_SIZE_LEVELS[zoomLevel];
-  // Added transition to font styles for smooth zooming
-  const fontStyles = {
-    ...currentFontConfig,
-    base: `${currentFontConfig.base} transition-all duration-700 ease-in-out`,
-    h1: `${currentFontConfig.h1} font-extrabold transition-all duration-700 ease-in-out`,
-    h2: `${currentFontConfig.h2} font-bold transition-all duration-700 ease-in-out`,
-    h3: `${currentFontConfig.h3} font-bold transition-all duration-700 ease-in-out`,
-    h4: `${currentFontConfig.h4} font-bold transition-all duration-700 ease-in-out`,
-    lineHeight: 'leading-relaxed',
+  // Navigation Handlers
+  const handleModuleSelect = (module: CourseModule) => {
+      setActiveModule(module);
+      setCurrentUnitIndex(0);
+      setShowQuiz(false);
+      setIsReadingMode(false);
+      setCurrentView('player');
+      setShowMobileSettings(false);
+      setTimeout(scrollToTop, 50);
   };
 
-  const isCurrentPageBookmarked = bookmarkedPages.includes(currentPage);
-
-  return (
-    <div className="min-h-screen bg-[#f5f5f7] dark:bg-black text-gray-900 dark:text-gray-100 font-sans transition-colors duration-1000 ease-in-out overflow-x-hidden">
+  const handleNextUnit = () => {
+      if (!activeModule) return;
+      stopAudio(); // Stop audio on nav
       
-      {/* Ambient Background with Parallax */}
-      <div className="fixed inset-0 pointer-events-none z-0 transition-opacity duration-1000">
-        
-        {/* Light Mode Blobs */}
-        <div className={`absolute inset-0 transition-opacity duration-1000 ${theme === 'dark' ? 'opacity-0' : 'opacity-40'}`}>
-           <div ref={lightBlob1Ref} className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] will-change-transform">
-               <div className="w-full h-full bg-blue-300 rounded-full mix-blend-multiply filter blur-[120px] animate-blob"></div>
-           </div>
-           <div ref={lightBlob2Ref} className="absolute top-[-10%] right-[-10%] w-[50%] h-[50%] will-change-transform">
-               <div className="w-full h-full bg-purple-300 rounded-full mix-blend-multiply filter blur-[120px] animate-blob animation-delay-2000"></div>
-           </div>
-           <div ref={lightBlob3Ref} className="absolute bottom-[-10%] left-[20%] w-[50%] h-[50%] will-change-transform">
-               <div className="w-full h-full bg-pink-300 rounded-full mix-blend-multiply filter blur-[120px] animate-blob animation-delay-4000"></div>
-           </div>
-        </div>
+      if (currentUnitIndex < activeModule.pages.length - 1) {
+          setCurrentUnitIndex(prev => prev + 1);
+          scrollToTop();
+      } else {
+          if (activeModule.quiz) {
+              setShowQuiz(true);
+              scrollToTop();
+          } else {
+              updateProgress(activeModule.id);
+              handleNextModuleNavigation();
+          }
+      }
+  };
 
-        {/* Dark Mode Blobs */}
-        <div className={`absolute inset-0 transition-opacity duration-1000 ${theme === 'dark' ? 'opacity-30' : 'opacity-0'}`}>
-           <div ref={darkBlob1Ref} className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] will-change-transform">
-              <div className="w-full h-full bg-blue-900 rounded-full mix-blend-screen filter blur-[100px] animate-blob"></div>
-           </div>
-           <div ref={darkBlob2Ref} className="absolute top-[20%] right-[-10%] w-[50%] h-[50%] will-change-transform">
-              <div className="w-full h-full bg-indigo-900 rounded-full mix-blend-screen filter blur-[100px] animate-blob animation-delay-2000"></div>
-           </div>
-           <div ref={darkBlob3Ref} className="absolute bottom-[-10%] left-[20%] w-[50%] h-[50%] will-change-transform">
-              <div className="w-full h-full bg-purple-900 rounded-full mix-blend-screen filter blur-[100px] animate-blob animation-delay-4000"></div>
-           </div>
-        </div>
+  const handlePrevUnit = () => {
+      stopAudio(); // Stop audio on nav
+      if (showQuiz) {
+          setShowQuiz(false);
+          scrollToTop();
+      } else if (currentUnitIndex > 0) {
+          setCurrentUnitIndex(prev => prev - 1);
+          scrollToTop();
+      } else {
+          handlePrevModuleNavigation();
+      }
+  };
 
-      </div>
+  const handleNextModuleNavigation = () => {
+      stopAudio();
+      if (!activeModule) return;
+      const modules = getCourseStructure(progress);
+      const currentIndex = modules.findIndex(m => m.id === activeModule.id);
+      
+      if (currentIndex !== -1 && currentIndex < modules.length - 1) {
+          const nextMod = modules[currentIndex + 1];
+          setActiveModule(nextMod);
+          setCurrentUnitIndex(0);
+          setShowQuiz(false);
+          scrollToTop();
+      } else {
+          setCurrentView('dashboard');
+      }
+  };
 
-      <div className="relative z-10 flex flex-col md:flex-row">
-        
-        {/* Mobile Top Bar */}
-        <div className="md:hidden fixed top-0 left-0 right-0 h-16 bg-white/80 dark:bg-black/80 backdrop-blur-lg border-b border-gray-200 dark:border-gray-800 z-50 flex items-center justify-between px-4 transition-all duration-500">
-             <div className="text-lg font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-purple-600 dark:from-blue-400 dark:to-purple-400">
-               نموذج بدرية
+  const handlePrevModuleNavigation = () => {
+      stopAudio();
+      if (!activeModule) return;
+      const modules = getCourseStructure(progress);
+      const currentIndex = modules.findIndex(m => m.id === activeModule.id);
+
+      if (currentIndex > 0) {
+          const prevMod = modules[currentIndex - 1];
+          setActiveModule(prevMod);
+          setCurrentUnitIndex(prevMod.pages.length - 1);
+          setShowQuiz(false); 
+          scrollToTop();
+      }
+  };
+
+  const handleQuizComplete = (score: number) => {
+      if (activeModule && score >= 60) {
+          updateProgress(activeModule.id, score);
+      }
+  };
+
+  const handleBackToDashboard = () => {
+      stopAudio();
+      setCurrentView('dashboard');
+      setActiveModule(null);
+      setIsSidebarOpen(false);
+  };
+  
+  // Parallax Handler
+  const handlePlayerScroll = (e: React.UIEvent<HTMLElement>) => {
+      const scrollTop = e.currentTarget.scrollTop;
+      requestAnimationFrame(() => {
+          if (parallaxRef1.current) {
+              parallaxRef1.current.style.transform = `translateY(${scrollTop * 0.2}px) rotate(${scrollTop * 0.01}deg)`; 
+          }
+          if (parallaxRef2.current) {
+              parallaxRef2.current.style.transform = `translateY(${scrollTop * 0.1}px) rotate(-${scrollTop * 0.01}deg)`;
+          }
+      });
+  };
+
+  // Font Styling Logic
+  const getFontStyles = (level: number) => {
+    const styles = {
+        1: {
+            base: 'text-base leading-loose',
+            h1: 'text-3xl md:text-4xl',
+            h2: 'text-2xl md:text-3xl',
+            h3: 'text-xl',
+            h4: 'text-lg'
+        },
+        2: {
+            base: 'text-lg md:text-xl leading-[2.2]',
+            h1: 'text-4xl md:text-6xl',
+            h2: 'text-3xl md:text-4xl',
+            h3: 'text-2xl',
+            h4: 'text-xl'
+        },
+        3: {
+            base: 'text-xl md:text-2xl leading-[2.3]',
+            h1: 'text-5xl md:text-7xl',
+            h2: 'text-4xl md:text-5xl',
+            h3: 'text-3xl',
+            h4: 'text-2xl'
+        },
+        4: {
+            base: 'text-2xl md:text-3xl leading-[2.4]',
+            h1: 'text-6xl md:text-8xl',
+            h2: 'text-5xl md:text-6xl',
+            h3: 'text-4xl',
+            h4: 'text-3xl'
+        },
+        5: {
+            base: 'text-3xl md:text-4xl leading-[2.5]',
+            h1: 'text-7xl md:text-9xl',
+            h2: 'text-6xl md:text-7xl',
+            h3: 'text-5xl',
+            h4: 'text-4xl'
+        }
+    };
+    return styles[level as keyof typeof styles] || styles[2];
+  };
+
+  const activeFontStyles = getFontStyles(fontSizeLevel);
+
+  const increaseFontSize = () => setFontSizeLevel(prev => Math.min(prev + 1, 5));
+  const decreaseFontSize = () => setFontSizeLevel(prev => Math.max(prev - 1, 1));
+
+  // Loading View
+  if (loading) {
+      return <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900"><div className="animate-spin h-12 w-12 border-4 border-blue-500 rounded-full border-t-transparent"></div></div>;
+  }
+
+  // Landing View
+  if (currentView === 'landing') {
+      return (
+          <div className="min-h-screen bg-gray-50 dark:bg-gray-900 relative transition-colors duration-700 text-gray-900 dark:text-white">
+             <div className="absolute top-4 left-4 z-50 flex gap-4">
+                 <ThemeToggle theme={theme} onToggle={() => setTheme(t => t === 'light' ? 'dark' : 'light')} />
              </div>
-             <button 
-                onClick={() => setIsMobileMenuOpen(true)}
-                className="p-2 rounded-lg text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800"
-                aria-label="Menu"
-             >
-                 <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
-                 </svg>
-             </button>
-        </div>
-
-        {/* Mobile Sidebar Drawer Overlay */}
-        <div 
-            className={`md:hidden fixed inset-0 z-[60] bg-black/50 backdrop-blur-sm transition-opacity duration-500 
-                ${isMobileMenuOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}
-            `}
-            onClick={() => setIsMobileMenuOpen(false)}
-        >
-            <div 
-                className={`absolute top-0 right-0 bottom-0 w-[85%] max-w-sm bg-white dark:bg-gray-900 shadow-2xl transform transition-transform duration-500 ease-out-cubic flex flex-col
-                    ${isMobileMenuOpen ? 'translate-x-0' : 'translate-x-full'}
-                `}
-                onClick={e => e.stopPropagation()}
-            >
-                 <div className="p-4 border-b border-gray-100 dark:border-gray-800 flex justify-between items-center">
-                    <h2 className="text-lg font-bold text-gray-800 dark:text-gray-200">القائمة</h2>
-                    <button onClick={() => setIsMobileMenuOpen(false)} className="p-2 rounded-full hover:bg-gray-100 dark:hover:bg-gray-800 text-gray-500">
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                        </svg>
-                    </button>
+             <div className="max-w-4xl mx-auto pt-20 px-4 pb-10 flex flex-col gap-8">
+                 <Hero />
+                 <div className="flex justify-center gap-6">
+                     <button onClick={() => { setAuthMode('login'); setCurrentView('auth'); }} className="btn-liquid-primary px-10 py-5 rounded-3xl font-bold text-xl min-w-[180px]">تسجيل الدخول</button>
+                     <button onClick={() => { setAuthMode('signup'); setCurrentView('auth'); }} className="btn-liquid-secondary px-10 py-5 rounded-3xl font-bold text-xl min-w-[180px]">حساب جديد</button>
                  </div>
-                 <div className="p-4">
-                    <SearchBar onSearch={handleSearch} />
-                 </div>
-                 <div className="flex-1 overflow-y-auto p-4">
-                    <Sidebar 
-                      activeSectionId={activeSectionId}
-                      bookmarkedPages={bookmarkedPages}
-                      onNavigate={handleNavigate}
-                      onNavigateToPage={navigateToPage}
-                    />
-                 </div>
-                 <div className="p-4 border-t border-gray-100 dark:border-gray-800 flex justify-center">
-                    <ThemeToggle theme={theme} onToggle={handleThemeToggle} />
-                 </div>
-            </div>
-        </div>
-
-        {/* Desktop Sidebar */}
-        <aside 
-          className={`fixed top-4 right-4 bottom-4 w-80 rounded-3xl z-40 transform transition-all duration-700 cubic-bezier(0.4, 0, 0.2, 1) shadow-2xl
-            bg-white/70 dark:bg-gray-900/60 backdrop-blur-xl border border-white/20 dark:border-gray-700/30
-            flex flex-col overflow-hidden
-            ${isPreviewMode ? 'translate-x-[120%] opacity-0' : 'translate-x-0 opacity-100'}
-            hidden md:flex
-          `}
-        >
-          <div className="p-5 pb-2 border-b border-gray-200/50 dark:border-gray-700/50">
-             <h1 className="text-xl font-bold mb-4 text-center bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-purple-600 dark:from-blue-400 dark:to-purple-400">
-               نموذج بدرية
-             </h1>
-             <SearchBar onSearch={handleSearch} />
+             </div>
           </div>
+      );
+  }
 
-          <div className="flex-1 overflow-y-auto p-2 custom-scrollbar">
-            <Sidebar 
-              activeSectionId={activeSectionId}
-              bookmarkedPages={bookmarkedPages}
-              onNavigate={handleNavigate}
-              onNavigateToPage={navigateToPage}
+  // Auth View
+  if (currentView === 'auth') {
+      return authMode === 'login' 
+        ? <LoginView onViewChange={(v) => v === 'landing' ? setCurrentView('landing') : setAuthMode(v as any)} /> 
+        : <SignupView onViewChange={(v) => v === 'landing' ? setCurrentView('landing') : setAuthMode(v as any)} />;
+  }
+
+  // Dashboard View
+  if (currentView === 'dashboard') {
+      return (
+        <div className="relative transition-colors duration-700 text-gray-900 dark:text-white">
+            <Dashboard 
+              onModuleSelect={handleModuleSelect} 
+              theme={theme}
+              onToggleTheme={() => setTheme(t => t === 'light' ? 'dark' : 'light')}
             />
-          </div>
-
-          <div className="p-4 border-t border-gray-200/50 dark:border-gray-700/50 flex justify-center">
-             <ThemeToggle theme={theme} onToggle={handleThemeToggle} />
-          </div>
-        </aside>
-
-        {/* Main Content */}
-        <main 
-          className={`flex-1 transition-all duration-700 ease-out-cubic p-2 pt-20 md:pt-6 lg:p-8 pb-32 flex flex-col items-center
-            ${isPreviewMode ? 'mr-0' : 'md:mr-[21rem]'}
-          `}
-        >
-          <div className={`w-full transition-all duration-500 ${isPreviewMode ? 'max-w-7xl' : 'max-w-6xl'}`}>
-             {bookPages.map((page, index) => (
-                <BookPage 
-                    key={page.pageNumber}
-                    page={page}
-                    fontStyles={fontStyles}
-                    isActive={currentPage === page.pageNumber}
-                    isNavigatingTo={targetPageForAnimation === page.pageNumber}
-                    ref={el => pageRefs.current[index] = el}
-                    onNavigateToPage={navigateToPage}
-                    totalPages={bookPages.length}
-                    onPlayAudio={handlePlayAudio}
-                    isPlayingAudio={playingAudioPage === page.pageNumber}
-                    isGeneratingAudio={generatingPageId === page.pageNumber} // Only true if this specific page is loading
-                />
-             ))}
-          </div>
-        </main>
-
-        {/* Control Dock */}
-        <div 
-          className={`fixed bottom-8 left-1/2 -translate-x-1/2 z-50 transition-all duration-700 cubic-bezier(0.4, 0, 0.2, 1) max-w-[95vw]
-            ${isPreviewMode ? 'translate-y-[200%] opacity-0' : 'translate-y-0 opacity-100'}
-          `}
-        >
-          <div className="flex items-center gap-3 px-4 md:px-6 py-3 bg-white/80 dark:bg-gray-800/80 backdrop-blur-2xl rounded-full shadow-2xl border border-white/30 dark:border-gray-700/30 overflow-x-auto hide-scrollbar">
-            
-            <DockButton onClick={() => setIsPreviewMode(true)} label="وضع القراءة">
-               <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-               </svg>
-            </DockButton>
-            
-            <Divider />
-
-            <DockButton onClick={() => navigateToPage(currentPage - 1)} disabled={currentPage <= 1} label="السابق">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
-              </svg>
-            </DockButton>
-
-            <span className="font-mono font-bold text-gray-700 dark:text-gray-200 min-w-[2rem] md:min-w-[3rem] text-center text-sm whitespace-nowrap">
-              {currentPage}
-            </span>
-
-            <DockButton onClick={() => navigateToPage(currentPage + 1)} disabled={currentPage >= bookPages.length} label="التالي">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
-              </svg>
-            </DockButton>
-
-            <Divider />
-
-            <DockButton onClick={() => setZoomLevel(prev => Math.max(prev - 1, 0))} disabled={zoomLevel <= 0} label="تصغير">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 12H4" />
-              </svg>
-            </DockButton>
-
-            <DockButton onClick={() => setZoomLevel(prev => Math.min(prev + 1, FONT_SIZE_LEVELS.length - 1))} disabled={zoomLevel >= FONT_SIZE_LEVELS.length - 1} label="تكبير">
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-              </svg>
-            </DockButton>
-
-            <Divider />
-
-            <DockButton 
-              onClick={handleToggleBookmark} 
-              isActive={isCurrentPageBookmarked}
-              activeColor="text-yellow-500 dark:text-yellow-400"
-              label={isCurrentPageBookmarked ? "إزالة الحفظ" : "حفظ الصفحة"}
-            >
-               <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill={isCurrentPageBookmarked ? "currentColor" : "none"} viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" />
-               </svg>
-            </DockButton>
-
-          </div>
         </div>
+      );
+  }
 
-        <button
-          onClick={() => setIsPreviewMode(false)}
-          className={`fixed bottom-8 right-8 z-50 p-4 bg-black/70 dark:bg-white/70 backdrop-blur-md text-white dark:text-black rounded-full shadow-2xl 
-            border border-white/20 transition-all duration-500 hover:scale-110 hover:bg-black dark:hover:bg-white
-            ${isPreviewMode ? 'translate-y-0 opacity-100' : 'translate-y-20 opacity-0 pointer-events-none'}
-          `}
-          aria-label="Exit Preview"
-          title="خروج من وضع القراءة"
-        >
-            <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
-        </button>
-
-      </div>
+  // Player View (Main Content)
+  if (currentView === 'player' && activeModule) {
+      const currentPage = activeModule.pages[currentUnitIndex];
+      const isLastPage = currentUnitIndex === activeModule.pages.length - 1;
       
-      <style>{`
-        @keyframes blob {
-          0% { transform: translate(0px, 0px) scale(1); }
-          33% { transform: translate(30px, -50px) scale(1.1); }
-          66% { transform: translate(-20px, 20px) scale(0.9); }
-          100% { transform: translate(0px, 0px) scale(1); }
-        }
-        .animate-blob {
-          animation: blob 7s infinite;
-        }
-        .animation-delay-2000 {
-          animation-delay: 2s;
-        }
-        .animation-delay-4000 {
-          animation-delay: 4s;
-        }
-        .custom-scrollbar::-webkit-scrollbar {
-            width: 4px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-            background-color: rgba(156, 163, 175, 0.5);
-            border-radius: 20px;
-        }
-        .hide-scrollbar::-webkit-scrollbar {
-            display: none;
-        }
-        .hide-scrollbar {
-            -ms-overflow-style: none;
-            scrollbar-width: none;
-        }
-        .ease-out-cubic {
-            transition-timing-function: cubic-bezier(0.215, 0.61, 0.355, 1);
-        }
-        .will-change-transform {
-            will-change: transform;
-        }
-      `}</style>
-    </div>
-  );
+      const modules = getCourseStructure(progress);
+      const modIndex = modules.findIndex(m => m.id === activeModule.id);
+      const isFirstModule = modIndex === 0;
+      const canGoBack = showQuiz || currentUnitIndex > 0 || !isFirstModule;
+
+      const isAudioLoading = generatingPageId === currentPage.pageNumber;
+      const isAudioPlaying = playingAudioPage === currentPage.pageNumber;
+
+      // Sidebar Component
+      const ModuleSidebar = () => (
+          <div className="h-full overflow-y-auto p-4">
+              <h3 className="text-sm font-bold text-gray-500 dark:text-gray-400 mb-4 uppercase tracking-wider">محتويات الوحدة</h3>
+              <ul className="space-y-3">
+                  {activeModule.pages.map((p, idx) => (
+                      <li key={idx}>
+                          <button 
+                             onClick={() => { setCurrentUnitIndex(idx); setShowQuiz(false); setIsSidebarOpen(false); scrollToTop(); }}
+                             className={`w-full text-right px-4 py-4 rounded-2xl text-sm font-medium transition-all duration-300 border border-transparent
+                                ${currentUnitIndex === idx && !showQuiz 
+                                    ? 'bg-blue-600 text-white shadow-lg transform scale-105' 
+                                    : 'bg-gray-50 dark:bg-gray-800 text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-gray-700 hover:shadow-md hover:border-gray-200 dark:hover:border-gray-600'}
+                             `}
+                          >
+                             {p.content.find(c => c.type === 'heading')?.text || `جزء ${idx + 1}`}
+                          </button>
+                      </li>
+                  ))}
+                  {activeModule.quiz && (
+                      <li>
+                          <button 
+                             onClick={() => { setShowQuiz(true); setIsSidebarOpen(false); scrollToTop(); }}
+                             className={`w-full text-right px-4 py-4 rounded-2xl text-sm font-bold transition-all duration-300 flex items-center gap-2 border border-transparent
+                                ${showQuiz 
+                                    ? 'bg-gradient-to-r from-purple-600 to-purple-500 text-white shadow-lg transform scale-105' 
+                                    : 'bg-purple-50 dark:bg-purple-900/20 text-purple-600 dark:text-purple-300 hover:bg-purple-100 dark:hover:bg-purple-900/40 hover:shadow-md'}
+                             `}
+                          >
+                             <span>📝</span> اختبار المعلومات
+                          </button>
+                      </li>
+                  )}
+              </ul>
+          </div>
+      );
+
+      return (
+          <div className="flex h-screen bg-gray-50 dark:bg-black transition-colors duration-700 overflow-hidden text-gray-900 dark:text-white">
+              
+              {/* Desktop Sidebar (Hidden in Reading Mode) */}
+              {!isReadingMode && (
+                  <aside className="hidden md:block w-80 bg-white/80 dark:bg-gray-900/80 border-l border-gray-200 dark:border-gray-800 h-full overflow-hidden flex-shrink-0 z-20 shadow-2xl backdrop-blur-lg transition-all duration-500">
+                      <div className="h-20 flex items-center justify-between px-6 border-b border-gray-100 dark:border-gray-800">
+                          <button onClick={handleBackToDashboard} className="btn-glass-icon px-4 py-2 w-full rounded-xl flex items-center justify-center gap-2 text-sm font-bold">
+                              <div className="p-1 rounded-full bg-gray-200 dark:bg-gray-700">
+                                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>
+                              </div>
+                              الخروج
+                          </button>
+                      </div>
+                      <ModuleSidebar />
+                  </aside>
+              )}
+
+              {/* Main Content Area */}
+              <div className="flex-1 flex flex-col h-full relative overflow-hidden">
+                  
+                  {/* Ambient Parallax Background Elements */}
+                  <div className="absolute inset-0 z-0 pointer-events-none overflow-hidden">
+                      <div 
+                          ref={parallaxRef1}
+                          className="absolute top-[-20%] right-[-10%] w-[600px] h-[600px] bg-blue-400/10 dark:bg-blue-600/10 rounded-full mix-blend-multiply dark:mix-blend-screen filter blur-[80px] transition-transform duration-75 ease-linear will-change-transform"
+                      ></div>
+                      <div 
+                          ref={parallaxRef2}
+                          className="absolute bottom-[-20%] left-[-10%] w-[500px] h-[500px] bg-purple-400/10 dark:bg-purple-600/10 rounded-full mix-blend-multiply dark:mix-blend-screen filter blur-[80px] transition-transform duration-75 ease-linear will-change-transform"
+                      ></div>
+                  </div>
+
+                  {/* Header - Fixed controls */}
+                  <header className="h-16 md:h-20 bg-white/80 dark:bg-gray-900/80 backdrop-blur-md border-b border-gray-200 dark:border-gray-800 flex items-center justify-between px-4 z-30 sticky top-0 shadow-sm transition-all">
+                      
+                      {/* Right Side (Title & Menu) */}
+                      <div className="flex items-center gap-3 md:gap-4">
+                          {!isReadingMode && (
+                              <button 
+                                onClick={() => setIsSidebarOpen(true)} 
+                                className="md:hidden btn-glass-icon w-10 h-10 active:scale-90 transition-transform"
+                                aria-label="Menu"
+                              >
+                                  <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h7" /></svg>
+                              </button>
+                          )}
+                          <h2 className="font-bold text-base md:text-xl text-gray-900 dark:text-white truncate max-w-[150px] md:max-w-none leading-tight">{activeModule.title}</h2>
+                      </div>
+
+                      {/* Left Side (Controls) */}
+                      <div className="flex items-center gap-2 md:gap-3">
+                          
+                          {/* Audio (Always visible) */}
+                          <button
+                              onClick={handlePlayAudio}
+                              disabled={isAudioLoading}
+                              className={`btn-glass-icon w-10 h-10 rounded-full ${isAudioPlaying ? 'bg-red-50/80 text-red-500 border-red-200 shadow-[0_0_15px_rgba(239,68,68,0.4)]' : ''}`}
+                              title="استماع للصفحة"
+                          >
+                              {isAudioLoading ? (
+                                  <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+                              ) : isAudioPlaying ? (
+                                  <div className="flex items-end gap-0.5 h-4">
+                                      <div className="w-1 bg-red-500 rounded-full animate-[pulse_0.6s_ease-in-out_infinite]" style={{height: '40%'}}></div>
+                                      <div className="w-1 bg-red-500 rounded-full animate-[pulse_0.6s_ease-in-out_infinite_0.2s]" style={{height: '100%'}}></div>
+                                      <div className="w-1 bg-red-500 rounded-full animate-[pulse_0.6s_ease-in-out_infinite_0.4s]" style={{height: '60%'}}></div>
+                                  </div>
+                              ) : (
+                                  <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z"/></svg>
+                              )}
+                          </button>
+
+                          {/* Desktop Controls */}
+                          <div className="hidden md:flex items-center gap-3">
+                               <button 
+                                  onClick={() => setIsReadingMode(!isReadingMode)}
+                                  className={`btn-glass-icon w-10 h-10 group ${isReadingMode ? 'bg-blue-50 dark:bg-blue-900/40 text-blue-600' : ''}`}
+                               >
+                                   <div className="relative w-6 h-6">
+                                       <svg className={`w-6 h-6 absolute top-0 left-0 transition-all duration-500 ${isReadingMode ? 'opacity-0 scale-75 rotate-90' : 'opacity-100 scale-100 rotate-0'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                                       </svg>
+                                       <svg className={`w-6 h-6 absolute top-0 left-0 transition-all duration-500 ${!isReadingMode ? 'opacity-0 scale-75 -rotate-90' : 'opacity-100 scale-100 rotate-0'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.543-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l3.59 3.59m0 0A9.953 9.953 0 0112 5c4.478 0 8.268 2.943 9.543 7a10.025 10.025 0 01-4.132 5.411m0 0L21 21" />
+                                       </svg>
+                                   </div>
+                               </button>
+
+                               <div className="flex items-center gap-2 bg-white/50 dark:bg-gray-800/50 rounded-2xl p-1.5 border border-white/30 dark:border-gray-700 backdrop-blur-md">
+                                  <button
+                                    onClick={decreaseFontSize}
+                                    disabled={fontSizeLevel <= 1}
+                                    className="btn-glass-icon w-9 h-9 group rounded-xl"
+                                  >
+                                    <svg className="w-4 h-4 transition-transform duration-500 group-active:rotate-180" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 12H4" /></svg>
+                                  </button>
+                                  <span className="w-6 text-center text-xs font-black text-gray-600 dark:text-gray-300">A</span>
+                                  <button
+                                    onClick={increaseFontSize}
+                                    disabled={fontSizeLevel >= 5}
+                                    className="btn-glass-icon w-9 h-9 group rounded-xl"
+                                  >
+                                    <svg className="w-4 h-4 transition-transform duration-500 group-active:rotate-90" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                                  </button>
+                               </div>
+
+                              <ThemeToggle theme={theme} onToggle={() => setTheme(t => t === 'light' ? 'dark' : 'light')} />
+                          </div>
+
+                          {/* Mobile Settings Toggle */}
+                          <button 
+                              onClick={() => setShowMobileSettings(!showMobileSettings)}
+                              className={`md:hidden btn-glass-icon w-10 h-10 relative ${showMobileSettings ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-600' : ''}`}
+                          >
+                              <svg className="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                              </svg>
+                          </button>
+
+                      </div>
+                  </header>
+
+                  {/* Mobile Settings Dropdown */}
+                  {showMobileSettings && (
+                      <div className="md:hidden absolute top-16 left-4 right-4 z-40 animate-pop">
+                          <div className="glass-panel rounded-2xl p-4 shadow-2xl bg-white/90 dark:bg-gray-800/90 backdrop-blur-xl border border-gray-200 dark:border-gray-700 flex flex-col gap-4">
+                               
+                               <div className="flex justify-between items-center">
+                                   <span className="text-sm font-bold text-gray-600 dark:text-gray-300">المظهر</span>
+                                   <ThemeToggle theme={theme} onToggle={() => setTheme(t => t === 'light' ? 'dark' : 'light')} />
+                               </div>
+
+                               <div className="flex justify-between items-center border-t border-gray-200 dark:border-gray-700 pt-4">
+                                   <span className="text-sm font-bold text-gray-600 dark:text-gray-300">حجم الخط</span>
+                                   <div className="flex items-center gap-3 bg-gray-100 dark:bg-gray-900 rounded-xl p-1">
+                                      <button onClick={decreaseFontSize} disabled={fontSizeLevel <= 1} className="w-10 h-10 flex items-center justify-center rounded-lg bg-white dark:bg-gray-800 shadow-sm active:scale-90 transition-transform">
+                                        <span className="text-xs font-black">A-</span>
+                                      </button>
+                                      <button onClick={increaseFontSize} disabled={fontSizeLevel >= 5} className="w-10 h-10 flex items-center justify-center rounded-lg bg-white dark:bg-gray-800 shadow-sm active:scale-90 transition-transform">
+                                        <span className="text-lg font-black">A+</span>
+                                      </button>
+                                   </div>
+                               </div>
+
+                               <div className="flex justify-between items-center border-t border-gray-200 dark:border-gray-700 pt-4">
+                                   <span className="text-sm font-bold text-gray-600 dark:text-gray-300">وضع القراءة</span>
+                                   <button 
+                                      onClick={() => { setIsReadingMode(!isReadingMode); setShowMobileSettings(false); }}
+                                      className={`px-4 py-2 rounded-xl text-sm font-bold transition-colors ${isReadingMode ? 'bg-blue-500 text-white shadow-md' : 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300'}`}
+                                   >
+                                      {isReadingMode ? 'مفعل' : 'معطل'}
+                                   </button>
+                               </div>
+                          </div>
+                      </div>
+                  )}
+
+                  {/* Mobile Sidebar Drawer */}
+                  {isSidebarOpen && (
+                      <div className="fixed inset-0 z-50 md:hidden">
+                          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm transition-opacity" onClick={() => setIsSidebarOpen(false)}></div>
+                          <div className="absolute top-0 right-0 h-full w-[85%] max-w-[320px] bg-white dark:bg-gray-900 shadow-2xl animate-slide-in-right flex flex-col">
+                               {/* New Clear Header */}
+                               <div className="h-16 flex items-center justify-between px-6 border-b border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-800/50">
+                                  <span className="font-black text-lg text-gray-900 dark:text-white">فهرس المحتوى</span>
+                                  <button 
+                                    onClick={() => setIsSidebarOpen(false)} 
+                                    className="w-8 h-8 flex items-center justify-center rounded-full bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-300"
+                                  >
+                                    ✕
+                                  </button>
+                               </div>
+                               
+                               {/* Explicit Exit Button */}
+                               <div className="p-4 border-b border-gray-100 dark:border-gray-800">
+                                   <button 
+                                      onClick={handleBackToDashboard}
+                                      className="w-full btn-liquid-secondary px-4 py-3 rounded-2xl font-bold text-sm flex items-center justify-center gap-2 text-red-600 dark:text-red-400 border-red-100 dark:border-red-900/30 hover:bg-red-50 dark:hover:bg-red-900/20"
+                                   >
+                                      <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
+                                      الخروج للوحة التحكم
+                                   </button>
+                               </div>
+
+                               <ModuleSidebar />
+                          </div>
+                      </div>
+                  )}
+
+                  {/* Scrollable Page Content */}
+                  <main 
+                      ref={mainContentRef}
+                      className={`flex-1 overflow-y-auto p-4 scroll-auto z-10 relative transition-all duration-500 ${isReadingMode ? 'md:px-12 md:py-12 max-w-[95vw] mx-auto w-full' : 'md:p-10'} pb-32 md:pb-10`}
+                      onScroll={handlePlayerScroll}
+                  >
+                      {showQuiz && activeModule.quiz ? (
+                          <QuizView 
+                            questions={activeModule.quiz} 
+                            onComplete={handleQuizComplete}
+                            onRetry={() => { setShowQuiz(false); setCurrentUnitIndex(0); scrollToTop(); }} 
+                            onNextModule={handleNextModuleNavigation}
+                          />
+                      ) : (
+                          <BookPage 
+                            key={currentUnitIndex}
+                            page={currentPage}
+                            fontStyles={activeFontStyles} 
+                            onNavigateToPage={() => {}} 
+                            totalPages={1} 
+                            isActive={true}
+                            isNavigatingTo={false}
+                            onPlayAudio={() => {}} 
+                            isPlayingAudio={false}
+                            isGeneratingAudio={false}
+                          />
+                      )}
+
+                      {/* Bottom Nav Dock (Responsive) */}
+                      <div className="mt-16 mb-8 glass-panel bg-white/60 dark:bg-gray-800/60 rounded-3xl p-4 md:p-6 border border-gray-200 dark:border-gray-700 transition-all duration-500 max-w-4xl mx-auto shadow-xl backdrop-blur-md">
+                          <div className="flex flex-col md:flex-row gap-4 md:gap-0 justify-between items-center">
+                                {/* Previous Button */}
+                                <button 
+                                    onClick={handlePrevUnit}
+                                    disabled={!canGoBack}
+                                    className="w-full md:w-auto btn-liquid-secondary px-6 py-3.5 rounded-2xl font-bold text-sm disabled:opacity-30 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                                >
+                                    {currentUnitIndex === 0 && !showQuiz && !isFirstModule ? 'الوحدة السابقة' : 'السابق'}
+                                </button>
+
+                                {/* Progress Indicators (Hidden on small phones) */}
+                                <div className="hidden sm:flex gap-2 bg-gray-100 dark:bg-gray-800 p-1.5 rounded-full overflow-x-auto max-w-[200px] md:max-w-none scrollbar-hide">
+                                    {activeModule.pages.map((_, idx) => (
+                                        <div key={idx} className={`h-2 rounded-full transition-all duration-500 flex-shrink-0 ${idx === currentUnitIndex && !showQuiz ? 'bg-blue-500 w-8 shadow-[0_0_8px_rgba(59,130,246,0.6)]' : 'bg-gray-300 dark:bg-gray-600 w-2'}`}></div>
+                                    ))}
+                                    {activeModule.quiz && (
+                                        <div className={`h-2 rounded-full transition-all duration-500 flex-shrink-0 ${showQuiz ? 'bg-purple-500 w-8 shadow-[0_0_8px_rgba(168,85,247,0.6)]' : 'bg-gray-300 dark:bg-gray-600 w-2'}`}></div>
+                                    )}
+                                </div>
+
+                                {/* Next Button */}
+                                {!showQuiz ? (
+                                    <button 
+                                        onClick={handleNextUnit}
+                                        className="w-full md:w-auto btn-liquid-primary px-8 py-3.5 rounded-2xl font-bold text-sm flex items-center justify-center gap-2 group"
+                                    >
+                                        {isLastPage && activeModule.quiz ? 'بدء الاختبار' : isLastPage ? 'التالي' : 'التالي'}
+                                        <span className="text-lg group-active:translate-x-1 transition-transform">{isLastPage && activeModule.quiz ? '📝' : '←'}</span>
+                                    </button>
+                                ) : (
+                                    <button onClick={handleBackToDashboard} className="w-full md:w-auto btn-liquid-secondary px-6 py-3.5 font-bold rounded-2xl">
+                                    خروج
+                                    </button>
+                                )}
+                          </div>
+                      </div>
+                  </main>
+              </div>
+          </div>
+      );
+  }
+
+  return null;
 };
 
-const DockButton: React.FC<{ 
-    onClick: () => void; 
-    children: React.ReactNode; 
-    disabled?: boolean;
-    isActive?: boolean;
-    activeColor?: string;
-    label: string;
-    className?: string;
-}> = ({ onClick, children, disabled, isActive, activeColor, label, className }) => (
-    <button
-        onClick={onClick}
-        disabled={disabled}
-        title={label}
-        className={`group relative p-3 rounded-2xl transition-all duration-300 ease-out flex-shrink-0
-          ${disabled ? 'opacity-30 cursor-not-allowed' : 'hover:bg-white/50 dark:hover:bg-gray-700/50 hover:scale-125 active:scale-95'}
-          ${isActive ? (activeColor || 'text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/30') : 'text-gray-600 dark:text-gray-300'}
-          ${className || ''}
-        `}
-    >
-        {children}
-        <span className="hidden md:block absolute -top-10 left-1/2 transform -translate-x-1/2 px-2 py-1 bg-black/80 text-white text-xs rounded opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none whitespace-nowrap">
-            {label}
-        </span>
-    </button>
-);
-
-const Divider = () => (
-    <div className="w-px h-6 md:h-8 bg-gray-300/50 dark:bg-gray-600/50 mx-1 flex-shrink-0"></div>
-);
+const App: React.FC = () => {
+  return (
+    <AuthProvider>
+      <AppContent />
+    </AuthProvider>
+  );
+};
 
 export default App;

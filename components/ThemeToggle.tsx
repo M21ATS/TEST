@@ -11,14 +11,14 @@ const ThemeToggle: React.FC<ThemeToggleProps> = ({ theme, onToggle }) => {
     <button
       onClick={onToggle}
       aria-label="Toggle Theme"
-      className="relative group overflow-hidden rounded-full p-2 bg-white/50 dark:bg-black/50 backdrop-blur-lg border border-gray-200 dark:border-gray-700 shadow-xl transition-all duration-500 hover:scale-110"
+      className="btn-glass-icon w-10 h-10 rounded-full group relative overflow-hidden"
       title={theme === 'light' ? 'تفعيل الوضع الليلي' : 'تفعيل وضع النهار'}
     >
-      <div className="relative w-10 h-10 flex items-center justify-center">
+      <div className="relative w-full h-full flex items-center justify-center">
         
         {/* Sun / Moon Container */}
         <svg 
-          className="w-8 h-8 transition-transform duration-700 ease-spring" 
+          className="w-6 h-6 transition-transform duration-700 ease-[cubic-bezier(0.68,-0.55,0.27,1.55)]" 
           viewBox="0 0 24 24" 
           fill="none" 
           stroke="currentColor"
@@ -54,7 +54,7 @@ const ThemeToggle: React.FC<ThemeToggleProps> = ({ theme, onToggle }) => {
             />
             
             {/* Sun Rays (Only visible in Light mode) */}
-            <g className={`origin-center transition-opacity duration-500 ${theme === 'dark' ? 'opacity-0' : 'opacity-100'}`}>
+            <g className={`origin-center transition-all duration-500 ${theme === 'dark' ? 'opacity-0 scale-50 rotate-45' : 'opacity-100 scale-100 rotate-0'}`}>
                 <line x1="12" y1="1" x2="12" y2="3" strokeWidth="2" className="text-yellow-500" />
                 <line x1="12" y1="21" x2="12" y2="23" strokeWidth="2" className="text-yellow-500" />
                 <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" strokeWidth="2" className="text-yellow-500" />
@@ -66,18 +66,12 @@ const ThemeToggle: React.FC<ThemeToggleProps> = ({ theme, onToggle }) => {
             </g>
             
             {/* Stars (Only visible in Dark mode) */}
-             <g className={`transition-opacity duration-700 ${theme === 'dark' ? 'opacity-100' : 'opacity-0'}`}>
-                 <circle cx="18" cy="6" r="1" fill="white" className="animate-pulse" />
-                 <circle cx="6" cy="18" r="1" fill="white" className="animate-pulse delay-75" />
-                 <circle cx="19" cy="15" r="0.5" fill="white" />
+             <g className={`transition-all duration-700 ${theme === 'dark' ? 'opacity-100 scale-100' : 'opacity-0 scale-150'}`}>
+                 <circle cx="18" cy="6" r="1" fill="white" className="animate-[pulse_2s_infinite]" />
+                 <circle cx="6" cy="18" r="1" fill="white" className="animate-[pulse_3s_infinite_1s]" />
              </g>
         </svg>
       </div>
-      <style>{`
-        .ease-spring {
-            transition-timing-function: cubic-bezier(0.175, 0.885, 0.32, 1.275);
-        }
-      `}</style>
     </button>
   );
 };
